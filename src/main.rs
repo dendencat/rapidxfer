@@ -9,7 +9,7 @@ use rand::{rngs::OsRng, RngCore};
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs, io::{self, Read}, path::{Path, PathBuf}, process::Command};
+use std::{fs, io::Read, path::{Path, PathBuf}, process::Command};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
@@ -37,7 +37,7 @@ enum Cmd {
         output_dir: PathBuf,
         /// Verify GPG signature if present
         #[arg(long)]
-        gpg-verify: bool,
+        gpg_verify: bool,
         /// Optional passphrase via env/arg is discouraged; prompt is default
         #[arg(long)]
         passphrase: Option<String>,
@@ -128,7 +128,7 @@ fn nonce_with_counter(base: &[u8; NONCE_LEN], counter: u64) -> XNonce {
 }
 
 async fn send(host: &str, file: &Path, chunk_size_s: &str, sign: bool, pass_in: Option<String>) -> Result<()> {
-    let mut stream = TcpStream::connect(host).await?;
+    let stream = TcpStream::connect(host).await?;
     stream.set_nodelay(true)?;
     let mut writer = BufWriter::new(stream);
 
@@ -189,7 +189,7 @@ async fn send(host: &str, file: &Path, chunk_size_s: &str, sign: bool, pass_in: 
     let mut f = tokio::fs::File::open(file).await?;
     let mut buf = vec![0u8; chunk_size as usize];
     let mut counter: u64 = 0;
-    let mut sent: u64 = 0;
+    let mut _sent: u64 = 0;
 
     loop {
         let n = f.read(&mut buf).await?;
@@ -199,7 +199,7 @@ async fn send(host: &str, file: &Path, chunk_size_s: &str, sign: bool, pass_in: 
             .map_err(|_| anyhow!("encrypt failed"))?;
         writer.write_u32_le(n as u32).await?; // plaintext length
         writer.write_all(&ct).await?;
-        sent += n as u64;
+        _sent += n as u64;
         counter = counter.checked_add(1).ok_or_else(|| anyhow!("nonce counter overflow"))?;
     }
 
