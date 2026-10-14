@@ -337,6 +337,9 @@ async fn recv_stream<R: AsyncRead + Unpin>(r: R, outdir: &Path, gpg_verify: bool
     let mut reader = BufReader::new(r);
     let mut magic = [0u8; 8];
     timed(reader.read_exact(&mut magic)).await?;
+    if &magic == b"RXF-HDR1" {
+        bail!("相手の rapidxfer が旧版（RXF-HDR1）の可能性があります。両側を更新してください");
+    }
     if &magic != HDR_MAGIC {
         bail!("peer is not rapidxfer v2 (wrong port or incompatible version)");
     }
