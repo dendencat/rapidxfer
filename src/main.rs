@@ -14,7 +14,7 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::Duration,
 };
 use tokio::{
@@ -248,15 +248,9 @@ impl Sealer {
     }
 }
 
-async fn send_stream<W: AsyncWrite + Unpin>(w: W, file: &Path, chunk_size: usize, sign: bool, passphrase: &str) -> Result<u64> {
-    let mut writer = BufWriter::new(w);
-
-    let mut salt = [0u8; SALT_LEN];
-    OsRng.fill_bytes(&mut salt);
-    let mut base_nonce = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut base_nonce);
-    let key = derive_key(passphrase, &salt)?;
-
+/// Hashing and gpg signing (which may wait on pinentry) run before connecting,
+/// so the receiver's read timeout never covers them.
+fn prepare_meta(file: &Path, sign: bool) -> Result<Meta> {
     let filename = file
         .file_name()
         .ok_or_else(|| anyhow!("invalid filename"))?
@@ -266,6 +260,18 @@ async fn send_stream<W: AsyncWrite + Unpin>(w: W, file: &Path, chunk_size: usize
     let filesize = fs::metadata(file)?.len();
     let sha256 = sha256_file(file)?;
     let gpg_sig_armored = if sign { Some(gpg_sign(file)?) } else { None };
+    Ok(Meta { filename, filesize, sha256, gpg_sig_armored })
+}
+
+async fn send_stream<W: AsyncWrite + Unpin>(w: W, file: &Path, meta: &Meta, chunk_size: usize, passphrase: &str) -> Result<u64> {
+    let mut writer = BufWriter::new(w);
+
+    let mut salt = [0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
+    let mut base_nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut base_nonce);
+    let key = derive_key(passphrase, &salt)?;
+    let filesize = meta.filesize;
 
     let hdr = PublicHeader { chunk_size: chunk_size as u32, salt, base_nonce };
     let hdr_bytes = bopts(MAX_HDR_LEN as u64).serialize(&hdr)?;
@@ -276,8 +282,7 @@ async fn send_stream<W: AsyncWrite + Unpin>(w: W, file: &Path, chunk_size: usize
 
     let mut sealer = Sealer { cipher: XChaCha20Poly1305::new(&key), base_nonce, hdr_hash, counter: 0 };
 
-    let meta = Meta { filename, filesize, sha256, gpg_sig_armored };
-    let meta_bytes = bopts(MAX_META_LEN as u64).serialize(&meta).context("metadata too large")?;
+    let meta_bytes = bopts(MAX_META_LEN as u64).serialize(meta).context("metadata too large")?;
     sealer.write_record(&mut writer, &meta_bytes, 0).await?;
 
     let mut f = tokio::fs::File::open(file).await?;
@@ -309,13 +314,17 @@ async fn send_stream<W: AsyncWrite + Unpin>(w: W, file: &Path, chunk_size: usize
 }
 
 fn gpg_sign(file: &Path) -> Result<Vec<u8>> {
+    // Keep the terminal on stdin/stderr: pinentry needs it to ask for the key's passphrase,
+    // and gpg's own error message must reach the user.
     let out = Command::new("gpg")
         .args(["--batch", "--yes", "--armor", "--detach-sign", "--output", "-"])
         .arg(file)
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .output()
         .context("gpg sign failed to spawn")?;
     if !out.status.success() {
-        bail!("gpg sign failed (is your key configured?)");
+        bail!("gpg sign failed ({}); see the gpg message above", out.status);
     }
     Ok(out.stdout)
 }
@@ -480,9 +489,10 @@ async fn main() -> Result<()> {
             }
             let chunk_size = parse_chunk_size(&chunk_size)?;
             let passphrase = get_passphrase(passphrase)?;
+            let meta = prepare_meta(&file, sign)?;
             let stream = TcpStream::connect(&host).await?;
             stream.set_nodelay(true)?;
-            let sent = send_stream(stream, &file, chunk_size, sign, &passphrase).await?;
+            let sent = send_stream(stream, &file, &meta, chunk_size, &passphrase).await?;
             println!("OK: sent {} ({} bytes).", file.display(), sent);
             Ok(())
         }
@@ -618,7 +628,7 @@ mod tests {
         fs::write(&file, &data).unwrap();
         let (a, b) = tokio::io::duplex(64 * 1024);
         let f2 = file.clone();
-        let s = tokio::spawn(async move { send_stream(a, &f2, chunk, false, "pw").await });
+        let s = tokio::spawn(async move { send_stream(a, &f2, &prepare_meta(&f2, false)?, chunk, "pw").await });
         let r = recv_stream(b, &dst, false, "pw").await;
         let _ = s.await;
         if let Ok(rx) = &r {
@@ -643,7 +653,7 @@ mod tests {
         fs::write(&file, b"hello").unwrap();
         let (a, b) = tokio::io::duplex(64 * 1024);
         let f2 = file.clone();
-        tokio::spawn(async move { send_stream(a, &f2, 4096, false, "right").await });
+        tokio::spawn(async move { send_stream(a, &f2, &prepare_meta(&f2, false)?, 4096, "right").await });
         assert!(recv_stream(b, &dst, false, "wrong").await.is_err());
         assert_eq!(fs::read_dir(&dst).unwrap().count(), 0);
     }
@@ -657,7 +667,7 @@ mod tests {
         fs::write(dst.join("data.bin"), b"old").unwrap();
         let (a, b) = tokio::io::duplex(64 * 1024);
         let f2 = file.clone();
-        tokio::spawn(async move { send_stream(a, &f2, 4096, false, "pw").await });
+        tokio::spawn(async move { send_stream(a, &f2, &prepare_meta(&f2, false)?, 4096, "pw").await });
         assert!(recv_stream(b, &dst, false, "pw").await.is_err());
         assert_eq!(fs::read(dst.join("data.bin")).unwrap(), b"old");
         assert_eq!(fs::read_dir(&dst).unwrap().count(), 1);
@@ -669,7 +679,7 @@ mod tests {
         let file = src.join("data.bin");
         fs::write(&file, vec![7u8; size]).unwrap();
         let mut out = Vec::new();
-        send_stream(&mut out, &file, 4096, false, "pw").await.unwrap();
+        send_stream(&mut out, &file, &prepare_meta(&file, false).unwrap(), 4096, "pw").await.unwrap();
         out
     }
 
