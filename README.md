@@ -109,7 +109,7 @@ Windows のパス区切りは `\`、PATH の区切りは `;` です。空白を�
 Rust と Cargo を用意して、次を実行します。
 
 ```sh
-git clone https://github.com/yourname/rapidxfer.git
+git clone https://github.com/dendencat/rapidxfer.git
 cd rapidxfer
 cargo build --locked --release
 # 実行ファイル: target/release/rapidxfer

@@ -123,8 +123,12 @@ fn parse_chunk_size(s: &str) -> Result<usize> {
 
 /// Accept only a single filename that is safe on every supported OS.
 fn validate_filename(name: &str) -> Result<&str> {
-    if name.is_empty() || name.len() > MAX_NAME_LEN {
+    if name.is_empty() {
         bail!("invalid filename {name:?}: invalid filename length");
+    }
+    if name.len() > MAX_NAME_LEN {
+        let preview: String = name.chars().flat_map(char::escape_default).take(64).collect();
+        bail!("rejected \"{preview}…\" ({} bytes): name too long (max {MAX_NAME_LEN})", name.len());
     }
     if name.chars().any(|c| c.is_control()) {
         bail!("invalid filename {name:?}: control characters are not allowed");
@@ -139,7 +143,7 @@ fn validate_filename(name: &str) -> Result<&str> {
         bail!("invalid filename {name:?}: trailing space or '.' is not allowed");
     }
     let stem = name.split('.').next().unwrap_or_default();
-    let reserved = ["CON", "PRN", "AUX", "NUL"]
+    let reserved = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
         .iter()
         .any(|reserved| stem.eq_ignore_ascii_case(reserved))
         || (stem.len() == 4
@@ -534,7 +538,7 @@ mod tests {
             let bad = format!("a{c}b");
             assert!(validate_filename(&bad).is_err(), "{bad:?}");
         }
-        let mut reserved = vec!["CON".to_string(), "PRN".to_string(), "AUX".to_string(), "NUL".to_string()];
+        let mut reserved: Vec<String> = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].map(str::to_string).into();
         for n in 1..=9 {
             reserved.extend([format!("COM{n}"), format!("LPT{n}")]);
         }
@@ -552,6 +556,22 @@ mod tests {
         let err = validate_filename("bad\nname.txt").unwrap_err().to_string();
         assert_eq!(err, "invalid filename \"bad\\nname.txt\": control characters are not allowed");
         assert!(!err.chars().any(|c| c.is_control()));
+    }
+
+    #[test]
+    fn long_filename_error_is_bounded() {
+        for (name, preview) in [
+            ("a".repeat(12345), "a".repeat(64)),
+            ("\n".repeat(12345), r"\n".repeat(32)),
+            ("\"".repeat(12345), r#"\""#.repeat(32)),
+            ("あ".repeat(12345), r"\u{3042}".repeat(8)),
+            ("🦀".repeat(12345), format!("{}\\", r"\u{1f980}".repeat(7))),
+        ] {
+            let err = validate_filename(&name).unwrap_err().to_string();
+            assert_eq!(err, format!("rejected \"{preview}…\" ({} bytes): name too long (max 255)", name.len()));
+            assert!(err.len() <= 200, "error is {} bytes", err.len());
+            assert!(!err.chars().any(|c| c.is_control()));
+        }
     }
 
     #[tokio::test]
