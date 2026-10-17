@@ -28,12 +28,95 @@ Rust 製であり、XChaCha20-Poly1305 (AEAD) による暗号化と改ざん検�
 **クロスプラットフォーム**: Linux, macOS, Windows (WSL2 含む)。
 
 ## インストール
+
+### リリース版をダウンロード
+
+このリポジトリの GitHub の **Releases** から、同じタグのアーカイブと `SHA256SUMS` を同じフォルダーにダウンロードしてください。v0.1.1 のファイル名は次のとおりです（別のバージョンではタグ部分を置き換えます）。
+
+| OS | CPU | アーカイブ |
+| --- | --- | --- |
+| macOS | Apple Silicon | `rapidxfer-v0.1.1-macos-aarch64.tar.gz` |
+| macOS | Intel | `rapidxfer-v0.1.1-macos-x86_64.tar.gz` |
+| Linux (GNU/glibc) | x86_64 | `rapidxfer-v0.1.1-linux-x86_64.tar.gz` |
+| Linux (GNU/glibc) | ARM64 | `rapidxfer-v0.1.1-linux-aarch64.tar.gz` |
+| Windows | x86_64 | `rapidxfer-v0.1.1-windows-x86_64.zip` |
+
+各アーカイブには実行ファイルと `README.md` が入っています。展開前に、以下の手順で選択したアーカイブの SHA-256 が `SHA256SUMS` と一致することを確認してください。不一致ならインストールを中止してください。
+
+### macOS
+
+ダウンロード先でターミナルを開きます。Intel Mac では `archive` を表の Intel 用ファイル名に変更してください。
+
+```sh
+archive=rapidxfer-v0.1.1-macos-aarch64.tar.gz
+grep -F "  $archive" SHA256SUMS | shasum -a 256 -c - || exit 1
+mkdir -p rapidxfer-v0.1.1
+tar -xzf "$archive" -C rapidxfer-v0.1.1
+mkdir -p "$HOME/.local/bin"
+cp rapidxfer-v0.1.1/rapidxfer "$HOME/.local/bin/"
+chmod +x "$HOME/.local/bin/rapidxfer"
+export PATH="$HOME/.local/bin:$PATH"
+rapidxfer --help
 ```
+
+`export PATH="$HOME/.local/bin:$PATH"` を `~/.zshrc` にも追加すると、次回以降のターミナルでも使えます。
+
+### Linux
+
+ダウンロード先でシェルを開きます。ARM64 では `archive` を表の ARM64 用ファイル名に変更してください。
+
+```sh
+archive=rapidxfer-v0.1.1-linux-x86_64.tar.gz
+grep -F "  $archive" SHA256SUMS | sha256sum --check - || exit 1
+mkdir -p rapidxfer-v0.1.1
+tar -xzf "$archive" -C rapidxfer-v0.1.1
+mkdir -p "$HOME/.local/bin"
+cp rapidxfer-v0.1.1/rapidxfer "$HOME/.local/bin/"
+chmod +x "$HOME/.local/bin/rapidxfer"
+export PATH="$HOME/.local/bin:$PATH"
+rapidxfer --help
+```
+
+`export PATH="$HOME/.local/bin:$PATH"` を `~/.bashrc` など利用中のシェルの設定ファイルにも追加してください。Linux 版は Ubuntu 24.04 上でビルドするため、同等以降の glibc 環境が必要です。古い環境や musl 環境ではソースからビルドしてください。
+
+### Windows (PowerShell)
+
+ダウンロード先で PowerShell を開きます。`Get-FileHash` の値を `SHA256SUMS` の該当行と比較し、一致した場合だけ展開します。
+
+```powershell
+$archive = 'rapidxfer-v0.1.1-windows-x86_64.zip'
+$entry = @(Get-Content .\SHA256SUMS | Where-Object { $_ -match ('^[0-9a-fA-F]{64}  ' + [regex]::Escape($archive) + '$') })
+if ($entry.Count -ne 1) { throw 'SHA256SUMS に該当する行がありません' }
+$expected = ($entry[0] -split '  ', 2)[0]
+$actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+if ($actual -ne $expected) { throw 'SHA-256 が一致しません' }
+Expand-Archive -LiteralPath $archive -DestinationPath .\rapidxfer-v0.1.1
+$bin = Join-Path $env:LOCALAPPDATA 'rapidxfer\bin'
+New-Item -ItemType Directory -Path $bin -Force | Out-Null
+Copy-Item .\rapidxfer-v0.1.1\rapidxfer.exe $bin
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (($userPath -split ';') -notcontains $bin) {
+    [Environment]::SetEnvironmentVariable('Path', "$bin;$userPath", 'User')
+}
+$env:Path = "$bin;$env:Path"
+rapidxfer --help
+```
+
+Windows のパス区切りは `\`、PATH の区切りは `;` です。空白を含むパスは引用符で囲んでください。転送するファイル名には `CON`・`NUL` などの予約名、`<>:"/\|?*`、制御文字、末尾の空白やピリオドを使えません（他の OS でも互換性のため同じ制限があります）。
+
+### ソースからビルド
+
+Rust と Cargo を用意して、次を実行します。
+
+```sh
 git clone https://github.com/yourname/rapidxfer.git
 cd rapidxfer
-cargo build --release
+cargo build --locked --release
 # 実行ファイル: target/release/rapidxfer
+# Windows: target\release\rapidxfer.exe
 ```
+
+実行ファイルを上記と同じ PATH 上のフォルダーに置いてください。GPG 署名の作成・検証を使う場合は、別途 `gpg` をインストールし、PATH に追加する必要があります。
 
 ## 使い方
 ### 送信

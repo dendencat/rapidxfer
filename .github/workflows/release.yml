@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            os: linux
+            arch: x86_64
+          # Native ARM64 runner; no cross compiler or extra secrets required.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            os: linux
+            arch: aarch64
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            os: macos
+            arch: aarch64
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            os: macos
+            arch: x86_64
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            os: windows
+            arch: x86_64
+    env:
+      TARGET: ${{ matrix.target }}
+      ASSET_NAME: rapidxfer-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Build
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          cargo +stable build --locked --release --target "$TARGET"
+      - name: Package Linux and macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p package dist
+          cp "target/$TARGET/release/rapidxfer" README.md package/
+          chmod 755 package/rapidxfer
+          tar -czf "dist/$ASSET_NAME.tar.gz" -C package rapidxfer README.md
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package, dist -Force | Out-Null
+          Copy-Item "target/$env:TARGET/release/rapidxfer.exe" package/
+          Copy-Item README.md package/
+          Compress-Archive -Path package/rapidxfer.exe, package/README.md -DestinationPath "dist/$env:ASSET_NAME.zip"
+      - name: Upload archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.ASSET_NAME }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: rapidxfer-*
+          merge-multiple: true
+          path: dist
+      - name: Generate checksums
+        working-directory: dist
+        shell: bash
+        run: |
+          shopt -s nullglob
+          archives=( *.tar.gz *.zip )
+          test "${#archives[@]}" -eq 5
+          sha256sum -- "${archives[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "$RELEASE_TAG" --generate-notes
