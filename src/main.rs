@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::Read,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::Command,
     time::Duration,
 };
@@ -121,21 +121,35 @@ fn parse_chunk_size(s: &str) -> Result<usize> {
     Ok(v)
 }
 
-/// Accept only a single plain path component.
+/// Accept only a single filename that is safe on every supported OS.
 fn validate_filename(name: &str) -> Result<&str> {
     if name.is_empty() || name.len() > MAX_NAME_LEN {
-        bail!("invalid filename length");
+        bail!("invalid filename {name:?}: invalid filename length");
     }
-    if name.contains(['/', '\\', '\0']) || name.chars().any(|c| c.is_control()) {
-        bail!("invalid characters in filename");
+    if name.chars().any(|c| c.is_control()) {
+        bail!("invalid filename {name:?}: control characters are not allowed");
     }
-    let mut comps = Path::new(name).components();
-    match (comps.next(), comps.next()) {
-        (Some(Component::Normal(c)), None) if c == name => {}
-        _ => bail!("filename must be a single path element"),
+    if name.contains(['/', '\\']) || matches!(name, "." | "..") {
+        bail!("invalid filename {name:?}: filename must be a single path element");
+    }
+    if let Some(c) = name.chars().find(|c| matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*')) {
+        bail!("invalid filename {name:?}: invalid character {c:?}");
+    }
+    if name.ends_with(['.', ' ']) {
+        bail!("invalid filename {name:?}: trailing space or '.' is not allowed");
+    }
+    let stem = name.split('.').next().unwrap_or_default();
+    let reserved = ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+        || (stem.len() == 4
+            && (stem.as_bytes()[..3].eq_ignore_ascii_case(b"COM") || stem.as_bytes()[..3].eq_ignore_ascii_case(b"LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+    if reserved {
+        bail!("invalid filename {name:?}: reserved filename");
     }
     if name.starts_with('.') {
-        bail!("hidden filenames are not accepted");
+        bail!("invalid filename {name:?}: hidden filenames are not accepted");
     }
     Ok(name)
 }
@@ -507,13 +521,73 @@ mod tests {
 
     #[test]
     fn filename_validation() {
-        for ok in ["a.txt", "report 2026.pdf", "日本語.md"] {
+        for ok in ["a.txt", "report 2026.pdf", "日本語.md", "aあ", "a..b", "COM0", "COM10.txt", "LPT0", "LPT10.txt", "CONSOLE.txt"] {
             assert!(validate_filename(ok).is_ok(), "{ok}");
         }
-        for bad in ["", ".", "..", "../x", "a/b", "/etc/passwd", "a\\b", ".ssh", "a\0b", "a\nb"] {
+        for bad in [
+            "", ".", "..", "../x", "..\\x", "a/b", "/etc/passwd", "a\\b", "C:", "C:\\x", "\\\\server\\x", ".ssh",
+            "a:b", "a<b", "a>b", "a\"b", "a|b", "a?b", "a*b", "a.", "a ",
+        ] {
             assert!(validate_filename(bad).is_err(), "{bad:?}");
         }
+        for c in ('\x00'..='\x1f').chain(std::iter::once('\x7f')) {
+            let bad = format!("a{c}b");
+            assert!(validate_filename(&bad).is_err(), "{bad:?}");
+        }
+        let mut reserved = vec!["CON".to_string(), "PRN".to_string(), "AUX".to_string(), "NUL".to_string()];
+        for n in 1..=9 {
+            reserved.extend([format!("COM{n}"), format!("LPT{n}")]);
+        }
+        for name in reserved {
+            for bad in [name.clone(), name.to_ascii_lowercase(), format!("{name}.txt"), format!("{}.txt", name.to_ascii_lowercase())] {
+                let err = validate_filename(&bad).unwrap_err().to_string();
+                assert!(err.contains("reserved filename"), "{err}");
+            }
+        }
         assert!(validate_filename(&"a".repeat(256)).is_err());
+    }
+
+    #[test]
+    fn filename_error_escapes_control_characters() {
+        let err = validate_filename("bad\nname.txt").unwrap_err().to_string();
+        assert_eq!(err, "invalid filename \"bad\\nname.txt\": control characters are not allowed");
+        assert!(!err.chars().any(|c| c.is_control()));
+    }
+
+    #[tokio::test]
+    async fn recv_rejects_filename_without_writing_outside_output_dir() {
+        let root = tmpdir("invalid-filename");
+        let dst = root.join("received");
+        fs::create_dir(&dst).unwrap();
+        let hdr = PublicHeader { chunk_size: MIN_CHUNK as u32, salt: [0; SALT_LEN], base_nonce: [0; NONCE_LEN] };
+        let hdr_bytes = bopts(MAX_HDR_LEN as u64).serialize(&hdr).unwrap();
+        let key = derive_key("pw", &hdr.salt).unwrap();
+        let mut sealer = Sealer {
+            cipher: XChaCha20Poly1305::new(&key),
+            base_nonce: hdr.base_nonce,
+            hdr_hash: Sha256::digest(&hdr_bytes).into(),
+            counter: 0,
+        };
+        let data = b"file contents";
+        let meta = Meta {
+            filename: "../outside.txt".to_string(),
+            filesize: data.len() as u64,
+            sha256: Sha256::digest(data).into(),
+            gpg_sig_armored: None,
+        };
+        let mut stream = Vec::new();
+        stream.extend_from_slice(HDR_MAGIC);
+        stream.extend_from_slice(&(hdr_bytes.len() as u32).to_le_bytes());
+        stream.extend_from_slice(&hdr_bytes);
+        let meta_bytes = bopts(MAX_META_LEN as u64).serialize(&meta).unwrap();
+        sealer.write_record(&mut stream, &meta_bytes, 0).await.unwrap();
+        sealer.write_record(&mut stream, data, FLAG_FINAL).await.unwrap();
+
+        let err = recv_stream(&stream[..], &dst, false, "pw").await.unwrap_err();
+        assert_eq!(err.to_string(), "invalid filename \"../outside.txt\": filename must be a single path element");
+        assert_eq!(fs::read_dir(&dst).unwrap().count(), 0);
+        let entries: Vec<_> = fs::read_dir(&root).unwrap().map(|entry| entry.unwrap().path()).collect();
+        assert_eq!(entries, [dst], "nothing may be written outside the output directory");
     }
 
     async fn roundtrip(size: usize, chunk: usize, tag: &str) -> Result<Received> {
